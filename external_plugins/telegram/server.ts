@@ -19,7 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -115,6 +115,9 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 // bot.pid is kept for observability + shutdown()/watchdog compatibility; the
 // lock above is the real single-poller authority.
 writeFileSync(PID_FILE, String(process.pid))
+
+// Fork marker — distinguishes this build from upstream in logs.
+process.stderr.write(`telegram channel: dmitry fork v0.0.6-dmitry.1 (flock single-poller + access-denied logging, #1481)\n`)
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -272,34 +275,57 @@ type GateResult =
   | { action: 'drop' }
   | { action: 'pair'; code: string; isResend: boolean }
 
+// Audit trail for ANY non-authorized inbound activity — denied messages,
+// denied commands, and pairing attempts from unknown senders. Written per
+// instance to <STATE_DIR>/access-denied.log, so each bot keeps its own log.
+function logDenied(ctx: Context, reason: string): void {
+  const f = ctx.from
+  const who = f
+    ? `id=${f.id}${f.username ? ` @${f.username}` : ''}${f.first_name ? ` ${f.first_name}` : ''}`
+    : 'unknown'
+  const where = ctx.chat?.type === 'private' ? 'DM' : `${ctx.chat?.type ?? '?'} chat=${ctx.chat?.id}`
+  const text = ctx.message?.text ?? ''
+  const snippet = text ? ` text=${JSON.stringify(text.slice(0, 100))}` : ''
+  const line = `${new Date().toISOString()}  ${who}  ${where}  — ${reason}${snippet}\n`
+  process.stderr.write(`telegram channel: denied — ${line}`)
+  try { appendFileSync(join(STATE_DIR, 'access-denied.log'), line) } catch {}
+}
+
+// Logs the denial and returns the drop verdict in one expression.
+function dropLogged(ctx: Context, reason: string): GateResult {
+  logDenied(ctx, reason)
+  return { action: 'drop' }
+}
+
 function gate(ctx: Context): GateResult {
   const access = loadAccess()
   const pruned = pruneExpired(access)
   if (pruned) saveAccess(access)
 
-  if (access.dmPolicy === 'disabled') return { action: 'drop' }
+  if (access.dmPolicy === 'disabled') return dropLogged(ctx, 'dmPolicy=disabled')
 
   const from = ctx.from
-  if (!from) return { action: 'drop' }
+  if (!from) return dropLogged(ctx, 'no sender')
   const senderId = String(from.id)
   const chatType = ctx.chat?.type
 
   if (chatType === 'private') {
     if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
-    if (access.dmPolicy === 'allowlist') return { action: 'drop' }
+    if (access.dmPolicy === 'allowlist') return dropLogged(ctx, 'sender not on DM allowlist')
 
     // pairing mode — check for existing non-expired code for this sender
     for (const [code, p] of Object.entries(access.pending)) {
       if (p.senderId === senderId) {
         // Reply twice max (initial + one reminder), then go silent.
-        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
+        if ((p.replies ?? 1) >= 2) return dropLogged(ctx, 'pairing reminder cap reached')
         p.replies = (p.replies ?? 1) + 1
         saveAccess(access)
+        logDenied(ctx, 'pairing reminder (unknown sender)')
         return { action: 'pair', code, isResend: true }
       }
     }
     // Cap pending at 3. Extra attempts are silently dropped.
-    if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
+    if (Object.keys(access.pending).length >= 3) return dropLogged(ctx, 'pending pairing cap (3) reached')
 
     const code = randomBytes(3).toString('hex') // 6 hex chars
     const now = Date.now()
@@ -311,25 +337,26 @@ function gate(ctx: Context): GateResult {
       replies: 1,
     }
     saveAccess(access)
+    logDenied(ctx, 'pairing code issued (unknown sender)')
     return { action: 'pair', code, isResend: false }
   }
 
   if (chatType === 'group' || chatType === 'supergroup') {
     const groupId = String(ctx.chat!.id)
     const policy = access.groups[groupId]
-    if (!policy) return { action: 'drop' }
+    if (!policy) return dropLogged(ctx, 'group not configured')
     const groupAllowFrom = policy.allowFrom ?? []
     const requireMention = policy.requireMention ?? true
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
-      return { action: 'drop' }
+      return dropLogged(ctx, 'sender not in group allowFrom')
     }
     if (requireMention && !isMentioned(ctx, access.mentionPatterns)) {
-      return { action: 'drop' }
+      return dropLogged(ctx, 'mention required, none')
     }
     return { action: 'deliver', access }
   }
 
-  return { action: 'drop' }
+  return dropLogged(ctx, `unsupported chat type: ${chatType}`)
 }
 
 // Like gate() but for bot commands: no pairing side effects, just allow/drop.
@@ -340,6 +367,9 @@ function dmCommandGate(ctx: Context): { access: Access; senderId: string } | nul
   const access = loadAccess()
   const pruned = pruneExpired(access)
   if (pruned) saveAccess(access)
+  // Log any command from a sender not on the allowlist — whether it gets denied
+  // outright or merely answered with pairing instructions, it's unknown activity.
+  if (!access.allowFrom.includes(senderId)) logDenied(ctx, 'command from non-allowlisted sender')
   if (access.dmPolicy === 'disabled') return null
   if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(senderId)) return null
   return { access, senderId }
