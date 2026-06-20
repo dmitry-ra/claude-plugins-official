@@ -53,19 +53,67 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
-// Telegram allows exactly one getUpdates consumer per token. If a previous
-// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-// survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
+// Telegram allows exactly one getUpdates consumer per token. We enforce that
+// single-poller invariant with an OS auto-releasing lock instead of a pid-file
+// + SIGTERM (fix for issue #1481). The pid+kill approach killed live sibling
+// pollers AND could SIGTERM an unrelated process whose PID had been recycled;
+// a lock fixes both because it signals/kills no one — a live owner blocks us
+// and we yield, while a dead owner's lock is already gone (the kernel releases
+// it on ANY exit incl. SIGKILL). Three OS incarnations, one invariant, proven
+// by CI on Linux/macOS/Windows:
+//   linux  -> flock(2)        via libc.so.6
+//   darwin -> flock(2)        via libSystem.dylib
+//   win32  -> CreateMutexW    via kernel32 (Local\ namespace, per-stateDir)
+// True orphans (parent claude died) still self-terminate via the watchdog below.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
+{
+  const yieldToOwner = () => {
+    process.stderr.write(`telegram channel: active poller holds the lock, yielding (local patch for issue #1481)\n`)
+    process.exit(0)
   }
-} catch {}
+  try {
+    const { dlopen, FFIType, ptr } = require('bun:ffi')
+    if (process.platform === 'linux' || process.platform === 'darwin') {
+      const { openSync } = require('fs')
+      const libc = dlopen(process.platform === 'darwin' ? 'libSystem.dylib' : 'libc.so.6', {
+        flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+      }).symbols
+      // fd intentionally kept open for the process lifetime — closing releases
+      // the lock; the OS closes it on exit, giving auto-release for free.
+      const lockFd = openSync(join(STATE_DIR, 'bot.lock'), 'w')
+      if (libc.flock(lockFd, 2 | 4 /* LOCK_EX | LOCK_NB */) !== 0) yieldToOwner()
+    } else if (process.platform === 'win32') {
+      const { createHash } = require('crypto')
+      const k32 = dlopen('kernel32.dll', {
+        CreateMutexW: { args: [FFIType.ptr, FFIType.i32, FFIType.ptr], returns: FFIType.u64 },
+        GetLastError: { args: [], returns: FFIType.u32 },
+        CloseHandle: { args: [FFIType.u64], returns: FFIType.i32 },
+      }).symbols
+      // Per-user (Local\) named mutex; name derived from STATE_DIR for per-bot isolation.
+      const tag = createHash('sha1').update(STATE_DIR).digest('hex').slice(0, 16)
+      const wname = Buffer.from(`Local\\claude-telegram-${tag}\0`, 'utf16le')
+      const handle = k32.CreateMutexW(null, 0, ptr(wname))
+      if (k32.GetLastError() === 183 /* ERROR_ALREADY_EXISTS */) {
+        k32.CloseHandle(handle)
+        yieldToOwner()
+      }
+    }
+    // unknown platform: no lock primitive — fall through, run single-session best-effort.
+  } catch (err) {
+    // FFI/lock unavailable — degrade to a non-destructive pid check that yields
+    // to a live holder (never SIGTERMs it, so #1481 stays fixed).
+    process.stderr.write(`telegram channel: lock primitive unavailable (${err}); falling back to pid check\n`)
+    try {
+      const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+      if (stale > 1 && stale !== process.pid) {
+        process.kill(stale, 0)
+        yieldToOwner()
+      }
+    } catch {}
+  }
+}
+// bot.pid is kept for observability + shutdown()/watchdog compatibility; the
+// lock above is the real single-poller authority.
 writeFileSync(PID_FILE, String(process.pid))
 
 // Last-resort safety net — without these the process dies silently on any
