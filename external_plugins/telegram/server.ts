@@ -21,9 +21,11 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
+import { execFileSync } from 'child_process'
 import { join, extname, sep } from 'path'
 
-const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+const STATE_DIR = process.env.TELEGRAM_STATE_DIR
+  ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -117,7 +119,7 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 writeFileSync(PID_FILE, String(process.pid))
 
 // Fork marker — distinguishes this build from upstream in logs.
-process.stderr.write(`telegram channel: dmitry fork v0.0.6-dmitry.1 (flock single-poller + access-denied logging, #1481)\n`)
+process.stderr.write(`telegram channel: dmitry fork v0.0.7-dmitry.1 (flock single-poller + access-denied logging, #1481)\n`)
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -742,16 +744,14 @@ process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 process.on('SIGHUP', shutdown)
 
-// Orphan watchdog: stdin events above don't reliably fire when the parent
-// chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
-// reparenting (POSIX) or a dead stdin pipe and self-terminate.
-const bootPpid = process.ppid
+// Orphan watchdog: belt-and-suspenders for the stdin 'end'/'close' handlers
+// above. Stdin is the MCP transport pipe inherited straight from the CLI; the
+// kernel closes it on any CLI death (clean, crash, SIGKILL, OOM) regardless of
+// intermediate wrappers. A ppid-change check used to live here but it
+// false-fires when the bun-run/shell wrapper exits or execs during normal
+// startup and we get reparented to init.
 setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) shutdown()
+  if (process.stdin.destroyed || process.stdin.readableEnded) shutdown()
 }, 5000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
